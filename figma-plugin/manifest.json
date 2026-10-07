@@ -1,0 +1,12 @@
+{
+  "name": "MD Portfolio Builder",
+  "id": "md-portfolio-builder-dev",
+  "api": "1.0.0",
+  "main": "code.js",
+  "editorType": ["figma"],
+  "documentAccess": "dynamic-page",
+  "networkAccess": { "allowedDomains": ["none"] },
+  "menu": [
+    { "name": "1단계 · 00_스타일·컴포넌트 만들기", "command": "step1" }
+  ]
+}
