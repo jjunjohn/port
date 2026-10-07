@@ -1,7 +1,7 @@
 // @ts-check
 // MD 포트폴리오 조립 플러그인
 // 내용: docs/01_포트폴리오_페이지별원고.md / 디자인: docs/02_디자인_지시문.md
-// 단계마다 메뉴 명령 하나. 지금은 1단계(00_스타일·컴포넌트)만 들어 있다.
+// 단계마다 메뉴 명령 하나.
 
 // ───────────────────────── 상수 ─────────────────────────
 
@@ -569,10 +569,395 @@ async function step1() {
   figma.closePlugin('1단계 완료: 색 5 · 텍스트 6 · 컴포넌트 7(+보조 1) · 글꼴 ' + ctx.family);
 }
 
+// ───────────────────────── 2단계 이후 공통: 페이지 조립 도구 ─────────────────────────
+
+const PAGE_MASTER = '마스터';
+const PAGE_H = 1080;
+const MARGIN_Y = 96;
+const SAFE_BOTTOM = PAGE_H - MARGIN_Y; // 984
+
+// 마스터 프레임 배치: [행, 열]. 행 = 섹션 묶음
+/** @type {Record<string, [number, number]>} */
+const MASTER_SLOT = {
+  '00 표지': [0, 0],
+  '목차': [0, 1],
+  '01 ABOUT ME': [0, 2],
+};
+
+/**
+ * @typedef {{
+ *   hl: ComponentSetNode, labelRow: ComponentSetNode, toc: ComponentSetNode,
+ *   header: ComponentNode, footnote: ComponentNode, caseBlock: ComponentNode,
+ *   badge: ComponentNode, img: ComponentNode,
+ * }} Comps
+ */
+
+/** 1단계에서 만든 컴포넌트를 이름으로 찾는다 @returns {Promise<Comps>} */
+async function loadComps() {
+  const page = figma.root.children.find((p) => p.name === PAGE_STYLE);
+  if (!page) throw new Error('"' + PAGE_STYLE + '" 페이지가 없습니다. 1단계를 먼저 실행하세요.');
+  await page.loadAsync();
+  /** @param {string} name @param {'COMPONENT' | 'COMPONENT_SET'} type */
+  const get = (name, type) => {
+    const n = page.findOne((x) => x.type === type && x.name === name);
+    if (!n) throw new Error('컴포넌트 "' + name + '"이 없습니다. 1단계를 먼저 실행하세요.');
+    return n;
+  };
+  return {
+    hl: /** @type {ComponentSetNode} */ (get('Highlight Text', 'COMPONENT_SET')),
+    labelRow: /** @type {ComponentSetNode} */ (get('Label Row', 'COMPONENT_SET')),
+    toc: /** @type {ComponentSetNode} */ (get('TOC Row', 'COMPONENT_SET')),
+    header: /** @type {ComponentNode} */ (get('Page Header', 'COMPONENT')),
+    footnote: /** @type {ComponentNode} */ (get('Footnote', 'COMPONENT')),
+    caseBlock: /** @type {ComponentNode} */ (get('Case Block', 'COMPONENT')),
+    badge: /** @type {ComponentNode} */ (get('Assumption Badge', 'COMPONENT')),
+    img: /** @type {ComponentNode} */ (get('Image Placeholder', 'COMPONENT')),
+  };
+}
+
+/** 컴포넌트(또는 세트의 변형 하나)로 인스턴스 @param {ComponentNode | ComponentSetNode} src @param {string} [variant] */
+function inst(src, variant) {
+  if (src.type === 'COMPONENT') return src.createInstance();
+  const v = src.children.find((n) => n.name === variant);
+  if (!v) throw new Error(src.name + ' 변형 "' + variant + '"이 없습니다.');
+  return /** @type {ComponentNode} */ (v).createInstance();
+}
+
+/**
+ * 인스턴스 속성을 이름(# 앞부분)으로 설정
+ * @param {InstanceNode} node @param {Record<string, string | boolean>} values
+ */
+function setProps(node, values) {
+  const keys = Object.keys(node.componentProperties);
+  /** @type {Record<string, string | boolean>} */
+  const out = {};
+  for (const name of Object.keys(values)) {
+    const key = keys.find((k) => k === name || k.split('#')[0] === name);
+    if (!key) throw new Error(node.name + '에 속성 "' + name + '"이 없습니다.');
+    out[key] = values[name];
+  }
+  node.setProperties(out);
+  return node;
+}
+
+/**
+ * 텍스트 + 크기 규칙. width를 주면 그 폭에서 줄바꿈
+ * @param {Ctx} ctx @param {string} chars @param {string} type @param {string} color
+ * @param {{w?: number, name?: string, align?: 'LEFT' | 'CENTER' | 'RIGHT'}} [o]
+ */
+async function T(ctx, chars, type, color, o) {
+  o = o || {};
+  const t = await txt(ctx, chars, type, color);
+  if (o.name) t.name = o.name;
+  if (o.align) t.textAlignHorizontal = o.align;
+  if (o.w) {
+    t.textAutoResize = 'HEIGHT';
+    t.resize(o.w, Math.max(1, t.height));
+  } else {
+    t.textAutoResize = 'WIDTH_AND_HEIGHT';
+  }
+  return t;
+}
+
+/**
+ * 오토 레이아웃 묶음 (배경 없음). w를 주면 너비 고정
+ * @param {string} name @param {'HORIZONTAL' | 'VERTICAL'} dir
+ * @param {SceneNode[]} kids
+ * @param {{gap?: number, w?: number, px?: number, py?: number, align?: 'MIN' | 'MAX' | 'CENTER' | 'BASELINE', fill?: boolean}} [o]
+ */
+function stack(name, dir, kids, o) {
+  o = o || {};
+  const f = autoLayout(named(figma.createFrame(), name), dir, o);
+  if (o.w) {
+    if (dir === 'VERTICAL') f.counterAxisSizingMode = 'FIXED';
+    else f.primaryAxisSizingMode = 'FIXED';
+    f.resize(o.w, Math.max(1, f.height));
+  }
+  for (const k of kids) {
+    f.appendChild(k);
+    // 세로 묶음의 고정 폭 안에서는 자식이 폭을 채운다 (텍스트·행)
+    if (o.fill && dir === 'VERTICAL' && 'layoutSizingHorizontal' in k) k.layoutSizingHorizontal = 'FILL';
+  }
+  return f;
+}
+
+/** @param {SceneNode} node @param {number} x @param {number} y */
+function place(node, x, y) {
+  node.x = x;
+  node.y = y;
+  return node;
+}
+
+/**
+ * 마스터 페이지 프레임(=컴포넌트, 두 버전에서 인스턴스로 배치).
+ * 같은 이름이 있으면: 인스턴스가 없을 때만 지우고 다시 만든다.
+ * @param {PageNode} page @param {string} name @param {Ctx} ctx
+ * @returns {Promise<ComponentNode | null>}
+ */
+async function masterFrame(page, name, ctx) {
+  const old = page.children.find((n) => n.type === 'COMPONENT' && n.name === name);
+  if (old) {
+    const used = await /** @type {ComponentNode} */ (old).getInstancesAsync();
+    if (used.length) return null;
+    old.remove();
+  }
+  const f = figma.createComponent();
+  page.appendChild(f);
+  f.name = name;
+  f.resize(PAGE_W, PAGE_H);
+  f.fills = [solid('#FFFFFF')];
+  await f.setFillStyleIdAsync(ctx.paint.bg);
+  f.clipsContent = true;
+  const slot = MASTER_SLOT[name] || [9, 0];
+  f.x = slot[1] * (PAGE_W + 160);
+  f.y = slot[0] * (PAGE_H + 240);
+  return f;
+}
+
+/**
+ * 표 한 줄: 가로 구분선만, 숫자 열은 오른쪽 정렬
+ * @param {Ctx} ctx @param {string} name
+ * @param {{w: number, type: string, color?: string, align?: 'LEFT' | 'CENTER' | 'RIGHT'}[]} cols
+ * @param {string[]} cells @param {{gap?: number, py?: number}} [o]
+ */
+async function tableRow(ctx, name, cols, cells, o) {
+  o = o || {};
+  /** @type {SceneNode[]} */
+  const kids = [];
+  for (let i = 0; i < cols.length; i++) {
+    const c = cols[i];
+    kids.push(await T(ctx, cells[i] || ' ', c.type, c.color || 'ink', { w: c.w, align: c.align, name: name + '/' + i }));
+  }
+  const row = stack(name, 'HORIZONTAL', kids, { gap: o.gap === undefined ? 32 : o.gap, py: o.py === undefined ? 14 : o.py, align: 'BASELINE' });
+  await bottomRule(ctx, row);
+  return row;
+}
+
+/**
+ * 안전 영역(좌우 120 / 상하 96) 밖으로 나간 글자를 찾는다
+ * @param {FrameNode | ComponentNode} frame @param {{allowFullBleed?: boolean}} [o]
+ */
+function overflowWarnings(frame, o) {
+  /** @type {string[]} */
+  const out = [];
+  const fb = frame.absoluteBoundingBox;
+  if (!fb) return out;
+  const texts = frame.findAll((n) => n.type === 'TEXT' && n.visible);
+  for (const t of texts) {
+    const b = t.absoluteBoundingBox;
+    if (!b) continue;
+    const x0 = b.x - fb.x, y0 = b.y - fb.y, x1 = x0 + b.width, y1 = y0 + b.height;
+    if (x0 < MARGIN_X - 1 || y0 < MARGIN_Y - 1 || x1 > PAGE_W - MARGIN_X + 1 || y1 > SAFE_BOTTOM + 1) {
+      out.push(frame.name + ' › ' + t.name + ' (아래 끝 ' + Math.round(y1) + 'px, 오른쪽 끝 ' + Math.round(x1) + 'px)');
+    }
+  }
+  return out;
+}
+
+/** @param {string} label @param {string[]} built @param {string[]} skipped @param {string[]} warns */
+function finish(label, built, skipped, warns) {
+  let msg = label + ' 완료: ' + (built.length ? built.join(', ') : '새로 만든 프레임 없음');
+  if (skipped.length) msg += ' / 건너뜀(이미 버전 페이지에서 사용 중): ' + skipped.join(', ');
+  if (warns.length) {
+    msg += ' / ⚠ 여백 밖 글자 ' + warns.length + '곳 — 콘솔 참고';
+    console.warn(warns.join('\n'));
+  }
+  figma.closePlugin(msg);
+}
+
+// ───────────────────────── 2단계: 표지 · 목차 · 01 ABOUT ME ─────────────────────────
+
+/** 00 표지 @param {Ctx} ctx @param {ComponentNode} f */
+async function buildCover(ctx, f) {
+  // 화면 왼쪽 3/4를 accent 블록으로 채우고 그 위에 글자(ink)
+  const block = figma.createRectangle();
+  block.name = 'accent block';
+  block.resize(1440, PAGE_H);
+  block.fills = [solid('#6EC6FF')];
+  await block.setFillStyleIdAsync(ctx.paint.accent);
+  f.appendChild(place(block, 0, 0));
+
+  const top = stack('cover/top', 'VERTICAL', [
+    await T(ctx, 'MD Portfolio', 'H3', 'ink', { name: 'cover/role' }),
+    // 버전 페이지에서 Platform MD / Brand MD 중 하나로 바꾼다
+    await T(ctx, 'Platform MD / Brand MD', 'Body', 'ink', { name: 'cover/subtitle (버전별)' }),
+  ], { gap: 8 });
+  f.appendChild(place(top, MARGIN_X, MARGIN_Y));
+
+  const bottom = stack('cover/main', 'VERTICAL', [
+    await T(ctx, '안준현', 'H1', 'ink', { name: 'cover/name' }),
+    await T(ctx, '데이터로 찾고, 현장으로 확인하고, 상품으로 결정합니다', 'H2', 'ink', { w: 1200, name: 'cover/one-liner' }),
+    await T(ctx, '확인된 것만 말합니다', 'Body', 'ink', { name: 'cover/tagline' }),
+  ], { gap: 24 });
+  f.appendChild(place(bottom, MARGIN_X, SAFE_BOTTOM - bottom.height));
+}
+
+// 목차 (마스터 = 브랜드 버전 번호. 플랫폼 버전은 03을 숨기고 번호를 당긴다)
+const TOC_ITEMS = [
+  ['01', 'About Me'],
+  ['02', 'Data — 26SS Denim Review'],
+  ['03', 'Brand Diagnosis'],
+  ['04', 'Product'],
+  ['05', 'Retail'],
+  ['06', 'FORK'],
+  ['07', 'O.F.F.'],
+  ['08', 'Activities'],
+  ['09', 'Skills'],
+  ['10', 'Contact'],
+];
+
+/** 목차 @param {Ctx} ctx @param {Comps} cp @param {ComponentNode} f */
+async function buildContents(ctx, cp, f) {
+  f.appendChild(place(await T(ctx, 'Contents', 'H1', 'ink', { name: 'toc/title' }), MARGIN_X, MARGIN_Y));
+
+  /** @type {SceneNode[]} */
+  const rows = [];
+  for (const [num, title] of TOC_ITEMS) {
+    const row = /** @type {InstanceNode} */ (inst(cp.toc, 'size=H2'));
+    row.name = 'toc/' + num + (num === '03' ? ' (브랜드 버전만)' : '');
+    setProps(row, { number: num });
+    const t = /** @type {InstanceNode} */ (row.findOne((n) => n.name === 'title' && n.type === 'INSTANCE'));
+    setProps(t, { text: title });
+    rows.push(row);
+  }
+  const list = stack('toc/list', 'VERTICAL', rows, { gap: 14 });
+  f.appendChild(place(list, 760, Math.round((PAGE_H - list.height) / 2)));
+}
+
+/** 01 ABOUT ME @param {Ctx} ctx @param {Comps} cp @param {ComponentNode} f */
+async function buildAbout(ctx, cp, f) {
+  // 위: 제목 | 기본 정보 (PLAC·NIKE 하이라이트)
+  const info = [
+    ['학력', '충북대학교 의류학과 (패션마케팅 + 디자인) 3학년 · 2028.02 졸업 예정', 'off'],
+    ['PLAC', '2025.05~2025.10 (6개월) · 매장, 주력 청바지', 'on'],
+    ['NIKE', '2026.02~2026.06 (5개월) · 백화점·쇼핑몰 입점 매장', 'on'],
+    ['O.F.F.', '2024.09~2025.08 · 전국대학생패션연합회 30.5기 (서울경인지부)', 'off'],
+    ['FORK', '패션 웹진 1인 운영 (진행 중)', 'off'],
+  ];
+  /** @type {SceneNode[]} */
+  const infoRows = [];
+  for (const [label, content, hl] of info) {
+    const r = /** @type {InstanceNode} */ (inst(cp.labelRow, 'highlight=' + hl));
+    r.name = 'about/info ' + label;
+    setProps(r, { label, content });
+    infoRows.push(r);
+  }
+  const infoCol = stack('about/info', 'VERTICAL', infoRows, { w: 1136, fill: true });
+  const titleCol = stack('about/title', 'VERTICAL', [
+    await T(ctx, '01', 'Caption', 'note', { name: 'about/section' }),
+    await T(ctx, 'About Me', 'H1', 'ink', { name: 'about/h1' }),
+  ], { gap: 12, w: 480 });
+  const top = stack('about/top', 'HORIZONTAL', [titleCol, infoCol], { gap: 64 });
+
+  // 아래 왼쪽: 역량 3개 × 증거 (페이지 번호 = 브랜드 버전 기준, 플랫폼 버전에서 당김)
+  /** @type {{w: number, type: string, color?: string, align?: 'LEFT' | 'CENTER' | 'RIGHT'}[]} */
+  const cols = [
+    { w: 340, type: 'H3' },
+    { w: 582, type: 'Body' },
+    { w: 80, type: 'Num', align: 'RIGHT' },
+  ];
+  const head = await tableRow(ctx, 'about/skills head', [
+    { w: 340, type: 'Caption', color: 'note' },
+    { w: 582, type: 'Caption', color: 'note' },
+    { w: 80, type: 'Caption', color: 'note', align: 'RIGHT' },
+  ], ['역량', '증거', '페이지'], { py: 10 });
+  const skills = [
+    ['① 데이터로 검증한다',
+      '이용약관 확인 후 공식 API로 재설계, 지수 함정을 대조군으로 걸러냄, 20·30대 재필터로 배럴 오판 방지, 댓글 100개 블라인드 검수',
+      '02'],
+    ['② 현장의 반복을 운영 변화로 바꾼다',
+      'PLAC: 평소 신는 신발 기준으로 기장을 잡고 매니저에게 제안해 신발 비치\nNIKE: 270~280 결품을 주간 회의에서 제품·사이즈로 짚어 보충 요청',
+      '05'],
+    ['③ 상품 구성과 재고를 보고 움직인다',
+      '팝업 굿즈 묶음·채널 전환·증정 제안으로 남은 재고를 움직임\n27SS 기장 운영안(플랫폼) · 블루브릭 상품 브리프와 배분·리오더 계산(브랜드)',
+      '07, 04'],
+  ];
+  /** @type {SceneNode[]} */
+  const skillRows = [head];
+  for (let i = 0; i < skills.length; i++) {
+    const r = await tableRow(ctx, 'about/skill ' + (i + 1), cols, skills[i]);
+    // 버전별로 바꿀 칸 표시
+    r.children[1].name = 'about/evidence ' + (i + 1) + (i === 2 ? ' (버전별)' : '');
+    r.children[2].name = 'about/page ' + (i + 1) + ' (버전별 번호)';
+    skillRows.push(r);
+  }
+  const skillTable = stack('about/skills table', 'VERTICAL', skillRows, { w: 1066, fill: true });
+  const extra = await T(ctx,
+    "정기 패션쇼 협찬 성사(셀리맥스) · 패션필름 'DRY-CLEANER' 팀장 · 패션 웹진 FORK 1인 운영",
+    'Body', 'note', { w: 1066, name: 'about/extra' });
+  const skillCol = stack('about/skills', 'VERTICAL', [skillTable, extra], { gap: 20, w: 1066 });
+
+  // 아래 오른쪽: 프로젝트-역량 맵 (작은 표, 페이지 번호 = 브랜드 버전 기준)
+  const mapCols = /** @type {{w: number, type: string, color?: string, align?: 'LEFT' | 'CENTER' | 'RIGHT'}[]} */ ([
+    { w: 190, type: 'Caption' },
+    { w: 90, type: 'Num', align: 'CENTER' },
+    { w: 90, type: 'Num', align: 'CENTER' },
+    { w: 90, type: 'Num', align: 'CENTER' },
+    { w: 90, type: 'Num', align: 'CENTER' },
+  ]);
+  const map = [
+    ['02 DATA', '●', '○', '○', ''],
+    ['04 27SS', '●', '○', '●', ''],
+    ['04 TNF', '', '', '●', '●'],
+    ['05 RETAIL', '', '●', '●', ''],
+    ['07 O.F.F.', '', '○', '●', '●'],
+    ['08 ACTIVITIES', '', '', '', '●'],
+  ];
+  /** @type {SceneNode[]} */
+  const mapRows = [
+    await T(ctx, '프로젝트-역량 맵', 'Caption', 'note', { name: 'about/map title' }),
+    await tableRow(ctx, 'about/map head', [
+      { w: 190, type: 'Caption', color: 'note' },
+      { w: 90, type: 'Caption', color: 'note', align: 'CENTER' },
+      { w: 90, type: 'Caption', color: 'note', align: 'CENTER' },
+      { w: 90, type: 'Caption', color: 'note', align: 'CENTER' },
+      { w: 90, type: 'Caption', color: 'note', align: 'CENTER' },
+    ], ['페이지', '데이터 검증', '현장 → 운영', '상품·재고 판단', '협업·실행'], { gap: 0, py: 8 }),
+  ];
+  for (const m of map) {
+    const r = await tableRow(ctx, 'about/map ' + m[0], mapCols, m, { gap: 0, py: 8 });
+    r.children[0].name = 'about/map page (버전별 번호)';
+    mapRows.push(r);
+  }
+  const mapCol = stack('about/map', 'VERTICAL', mapRows, { gap: 0, w: 550 });
+
+  const bottom = stack('about/bottom', 'HORIZONTAL', [skillCol, mapCol], { gap: 64 });
+  const all = stack('about/content', 'VERTICAL', [top, bottom], { gap: 48 });
+  f.appendChild(place(all, MARGIN_X, MARGIN_Y));
+}
+
+async function step2() {
+  const ctx = await loadCtx();
+  const cp = await loadComps();
+  const page = await findOrCreatePage(PAGE_MASTER);
+  await figma.setCurrentPageAsync(page);
+
+  /** @type {[string, (f: ComponentNode) => Promise<void>][]} */
+  const jobs = [
+    ['00 표지', (f) => buildCover(ctx, f)],
+    ['목차', (f) => buildContents(ctx, cp, f)],
+    ['01 ABOUT ME', (f) => buildAbout(ctx, cp, f)],
+  ];
+  /** @type {string[]} */ const built = [];
+  /** @type {string[]} */ const skipped = [];
+  /** @type {string[]} */ let warns = [];
+  /** @type {SceneNode[]} */ const frames = [];
+  for (const [name, build] of jobs) {
+    const f = await masterFrame(page, name, ctx);
+    if (!f) { skipped.push(name); continue; }
+    await build(f);
+    built.push(name);
+    frames.push(f);
+    warns = warns.concat(overflowWarnings(f));
+  }
+  if (frames.length) figma.viewport.scrollAndZoomIntoView(frames);
+  finish('2단계', built, skipped, warns);
+}
+
 // ───────────────────────── 진입점 ─────────────────────────
 
 /** @type {Record<string, () => Promise<void>>} */
-const COMMANDS = { step1 };
+const COMMANDS = { step1, step2 };
 
 (async () => {
   try {
@@ -585,5 +970,3 @@ const COMMANDS = { step1 };
   }
 })();
 
-// 2단계 이후에서 사용
-void loadCtx;
